@@ -30,3 +30,6 @@ Thumbs.db
 # Temporary files
 *.tmp
 *.log
+
+# WiFi credentials (never commit)
+review-2/config.h

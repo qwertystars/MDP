@@ -3,7 +3,7 @@
 # Date: 2026-01-13
 
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -std=c11
+CFLAGS = -Wall -Wextra -O2 -std=c11 -fstack-protector-strong -D_FORTIFY_SOURCE=2
 LDFLAGS = -lm
 TARGET = structure_integrity
 SOURCE = structure_integrity_prediction.c
@@ -34,6 +34,12 @@ debug: CFLAGS += -g -DDEBUG
 debug: clean $(TARGET)
 	@echo "✓ Debug build complete"
 
+# Sanitizer build for development (AddressSanitizer + UndefinedBehaviorSanitizer)
+sanitize: CFLAGS += -g -fsanitize=address,undefined -fno-omit-frame-pointer
+sanitize: LDFLAGS += -fsanitize=address,undefined
+sanitize: clean $(TARGET)
+	@echo "✓ Sanitizer build complete (run with: ./$(TARGET))"
+
 # Help message
 help:
 	@echo "Structure Integrity Prediction System - Build Instructions"
@@ -43,9 +49,10 @@ help:
 	@echo "  make run      - Build and run the program"
 	@echo "  make clean    - Remove build artifacts"
 	@echo "  make debug    - Build with debug symbols"
+	@echo "  make sanitize - Build with AddressSanitizer + UBSan"
 	@echo "  make help     - Show this help message"
 	@echo ""
 	@echo "Usage example:"
 	@echo "  make && ./structure_integrity"
 
-.PHONY: all run clean debug help
+.PHONY: all run clean debug sanitize help

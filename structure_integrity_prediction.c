@@ -82,6 +82,9 @@ typedef struct {
     int num_sensors;
     float overall_integrity;
     time_t last_analysis;
+    // Pre-computed distance caches for safe zone scoring
+    float nearest_exit_dist[MAX_GRID_SIZE][MAX_GRID_SIZE][MAX_GRID_SIZE];
+    float nearest_damage_dist[MAX_GRID_SIZE][MAX_GRID_SIZE][MAX_GRID_SIZE];
 } Building;
 
 // Safe zone information
@@ -106,6 +109,7 @@ float estimate_dominant_frequency(Building *building, int sensor_id);
 void visualize_building_status(Building *building);
 void generate_evacuation_path(Building *building, int start_x, int start_y, int start_z);
 void print_safety_report(Building *building);
+void precompute_distances(Building *building);
 
 // Mathematical helper functions
 float vector_magnitude(float x, float y, float z);
@@ -381,7 +385,14 @@ void analyze_structural_integrity(Building *building) {
                 } else if (cell->vibration_level > WARNING_VIBRATION_THRESHOLD) {
                     vibration_factor = 0.7;
                     cell->damage_factor += 0.02;
+                } else {
+                    // Partial recovery when vibration is below warning threshold
+                    cell->damage_factor -= 0.005;
                 }
+
+                // Cap damage_factor to [0.0, 1.0]
+                if (cell->damage_factor > 1.0) cell->damage_factor = 1.0;
+                if (cell->damage_factor < 0.0) cell->damage_factor = 0.0;
 
                 // Update integrity (cannot exceed 1.0, cannot go below 0.0)
                 cell->integrity = cell->integrity * vibration_factor - cell->damage_factor;
@@ -488,8 +499,47 @@ void propagate_damage(Building *building) {
 // SAFE ZONE IDENTIFICATION
 //=============================================================================
 
+void precompute_distances(Building *building) {
+    for (int z = 0; z < building->size_z; z++) {
+        for (int y = 0; y < building->size_y; y++) {
+            for (int x = 0; x < building->size_x; x++) {
+                float min_exit = 1000.0f;
+                float min_damage = 1000.0f;
+
+                for (int dz = 0; dz < building->size_z; dz++) {
+                    for (int dy = 0; dy < building->size_y; dy++) {
+                        for (int dx = 0; dx < building->size_x; dx++) {
+                            float dist = euclidean_distance_3d(x, y, z, dx, dy, dz);
+                            if (building->grid[dx][dy][dz].is_exit && dist < min_exit) {
+                                min_exit = dist;
+                            }
+                            if (building->grid[dx][dy][dz].status >= ZONE_CRITICAL && dist < min_damage) {
+                                min_damage = dist;
+                            }
+                        }
+                    }
+                }
+
+                building->nearest_exit_dist[x][y][z] = min_exit;
+                building->nearest_damage_dist[x][y][z] = min_damage;
+            }
+        }
+    }
+}
+
+int compare_safe_zones_desc(const void *a, const void *b) {
+    float sa = ((const SafeZone *)a)->safety_score;
+    float sb = ((const SafeZone *)b)->safety_score;
+    if (sb > sa) return 1;
+    if (sb < sa) return -1;
+    return 0;
+}
+
 void identify_safe_zones(Building *building, SafeZone *safe_zones, int *num_safe_zones) {
     *num_safe_zones = 0;
+
+    // Pre-compute distance caches once before scoring all cells
+    precompute_distances(building);
 
     for (int z = 0; z < building->size_z; z++) {
         for (int y = 0; y < building->size_y; y++) {
@@ -504,24 +554,14 @@ void identify_safe_zones(Building *building, SafeZone *safe_zones, int *num_safe
                     zone->z = z;
                     zone->safety_score = safety_score;
 
-                    // Find nearest exit
-                    float min_dist = 1000.0;
-                    for (int ez = 0; ez < building->size_z; ez++) {
-                        for (int ey = 0; ey < building->size_y; ey++) {
-                            for (int ex = 0; ex < building->size_x; ex++) {
-                                if (building->grid[ex][ey][ez].is_exit) {
-                                    float dist = euclidean_distance_3d(x, y, z, ex, ey, ez);
-                                    if (dist < min_dist) min_dist = dist;
-                                }
-                            }
-                        }
-                    }
-                    zone->distance_to_exit = min_dist;
+                    // Use pre-computed nearest exit distance
+                    zone->distance_to_exit = building->nearest_exit_dist[x][y][z];
 
                     // Generate reason
                     GridCell *cell = &building->grid[x][y][z];
-                    sprintf(zone->reason, "Integrity: %.0f%%, Low vibration: %.2f m/s², Clear path to exit",
-                            cell->integrity * 100, cell->vibration_level);
+                    snprintf(zone->reason, sizeof(zone->reason),
+                             "Integrity: %.0f%%, Low vibration: %.2f m/s², Clear path to exit",
+                             cell->integrity * 100, cell->vibration_level);
 
                     (*num_safe_zones)++;
                     if (*num_safe_zones >= 100) return;
@@ -530,16 +570,8 @@ void identify_safe_zones(Building *building, SafeZone *safe_zones, int *num_safe
         }
     }
 
-    // Sort safe zones by safety score (bubble sort for simplicity)
-    for (int i = 0; i < *num_safe_zones - 1; i++) {
-        for (int j = 0; j < *num_safe_zones - i - 1; j++) {
-            if (safe_zones[j].safety_score < safe_zones[j + 1].safety_score) {
-                SafeZone temp = safe_zones[j];
-                safe_zones[j] = safe_zones[j + 1];
-                safe_zones[j + 1] = temp;
-            }
-        }
-    }
+    // Sort safe zones by safety score (descending)
+    qsort(safe_zones, *num_safe_zones, sizeof(SafeZone), compare_safe_zones_desc);
 }
 
 float calculate_zone_safety_score(Building *building, int x, int y, int z) {
@@ -560,33 +592,13 @@ float calculate_zone_safety_score(Building *building, int x, int y, int z) {
     if (vib_score < 0) vib_score = 0;
     score += vib_score * 0.3;
 
-    // Factor 3: Distance from damaged zones (20% weight)
-    float min_damage_dist = 1000.0;
-    for (int dz = 0; dz < building->size_z; dz++) {
-        for (int dy = 0; dy < building->size_y; dy++) {
-            for (int dx = 0; dx < building->size_x; dx++) {
-                if (building->grid[dx][dy][dz].status >= ZONE_CRITICAL) {
-                    float dist = euclidean_distance_3d(x, y, z, dx, dy, dz);
-                    if (dist < min_damage_dist) min_damage_dist = dist;
-                }
-            }
-        }
-    }
+    // Factor 3: Distance from damaged zones (20% weight) — uses pre-computed cache
+    float min_damage_dist = building->nearest_damage_dist[x][y][z];
     float damage_score = normalize(min_damage_dist, 0, SAFE_DISTANCE_FACTOR * 2);
     score += damage_score * 0.2;
 
-    // Factor 4: Proximity to exit (10% weight)
-    float min_exit_dist = 1000.0;
-    for (int ez = 0; ez < building->size_z; ez++) {
-        for (int ey = 0; ey < building->size_y; ey++) {
-            for (int ex = 0; ex < building->size_x; ex++) {
-                if (building->grid[ex][ey][ez].is_exit) {
-                    float dist = euclidean_distance_3d(x, y, z, ex, ey, ez);
-                    if (dist < min_exit_dist) min_exit_dist = dist;
-                }
-            }
-        }
-    }
+    // Factor 4: Proximity to exit (10% weight) — uses pre-computed cache
+    float min_exit_dist = building->nearest_exit_dist[x][y][z];
     float exit_score = 1.0 - normalize(min_exit_dist, 0, building->size_x);
     score += exit_score * 0.1;
 
@@ -598,73 +610,117 @@ float calculate_zone_safety_score(Building *building, int x, int y, int z) {
 //=============================================================================
 
 void generate_evacuation_path(Building *building, int start_x, int start_y, int start_z) {
-    // Simple A* pathfinding to nearest exit avoiding damaged zones
     printf("\nEvacuation Path from [%d,%d,%d]:\n", start_x, start_y, start_z);
 
-    // Find nearest safe exit
-    float min_dist = 1000.0;
-    int exit_x = 0, exit_y = 0, exit_z = 0;
+    // BFS pathfinding to nearest exit, avoiding collapsed and critical zones
+    // 6-connected neighbors (±x, ±y, ±z)
+    static const int dx[] = {1, -1, 0, 0, 0, 0};
+    static const int dy[] = {0, 0, 1, -1, 0, 0};
+    static const int dz[] = {0, 0, 0, 0, 1, -1};
 
-    for (int z = 0; z < building->size_z; z++) {
-        for (int y = 0; y < building->size_y; y++) {
-            for (int x = 0; x < building->size_x; x++) {
-                if (building->grid[x][y][z].is_exit &&
-                    building->grid[x][y][z].status != ZONE_COLLAPSED) {
-                    float dist = euclidean_distance_3d(start_x, start_y, start_z, x, y, z);
-                    if (dist < min_dist) {
-                        min_dist = dist;
-                        exit_x = x;
-                        exit_y = y;
-                        exit_z = z;
-                    }
-                }
-            }
+    int sx = building->size_x, sy = building->size_y, sz = building->size_z;
+
+    // Visited array and parent tracking (packed as 1D index)
+    int total = sx * sy * sz;
+    #define IDX(x,y,z) ((x) + (y)*sx + (z)*sx*sy)
+
+    int *parent = (int *)malloc(total * sizeof(int));
+    if (!parent) {
+        printf("→ Memory allocation failed, cannot compute path\n");
+        return;
+    }
+    for (int i = 0; i < total; i++) parent[i] = -1;
+
+    int *queue = (int *)malloc(total * sizeof(int));
+    if (!queue) {
+        free(parent);
+        printf("→ Memory allocation failed, cannot compute path\n");
+        return;
+    }
+
+    int head = 0, tail = 0;
+    int start_idx = IDX(start_x, start_y, start_z);
+    parent[start_idx] = start_idx; // self-parent marks visited
+    queue[tail++] = start_idx;
+
+    int goal_idx = -1;
+
+    while (head < tail) {
+        int cur = queue[head++];
+        int cx = cur % sx;
+        int cy = (cur / sx) % sy;
+        int cz = cur / (sx * sy);
+
+        GridCell *cell = &building->grid[cx][cy][cz];
+        if (cell->is_exit && cell->status != ZONE_COLLAPSED) {
+            goal_idx = cur;
+            break;
+        }
+
+        for (int d = 0; d < 6; d++) {
+            int nx = cx + dx[d], ny = cy + dy[d], nz = cz + dz[d];
+            if (nx < 0 || nx >= sx || ny < 0 || ny >= sy || nz < 0 || nz >= sz)
+                continue;
+
+            int ni = IDX(nx, ny, nz);
+            if (parent[ni] != -1) continue; // already visited
+
+            ZoneStatus st = building->grid[nx][ny][nz].status;
+            if (st == ZONE_COLLAPSED || st == ZONE_CRITICAL) continue; // impassable
+
+            parent[ni] = cur;
+            queue[tail++] = ni;
         }
     }
 
-    printf("→ Nearest safe exit: [%d,%d,%d] (%.1fm away)\n", exit_x, exit_y, exit_z, min_dist);
-    printf("→ Recommended path: \n");
-    printf("   1. Move from current location [%d,%d,Floor %d]\n", start_x, start_y, start_z);
-
-    // Simple direct path (in real implementation, use A*)
-    if (start_z > exit_z) {
-        printf("   2. Descend to ground floor (avoid damaged staircases)\n");
+    if (goal_idx < 0) {
+        printf("→ No safe evacuation path found!\n");
+        free(parent);
+        free(queue);
+        return;
     }
 
-    if (start_x < exit_x) {
-        printf("   3. Move EAST towards exit\n");
-    } else if (start_x > exit_x) {
-        printf("   3. Move WEST towards exit\n");
+    // Reconstruct path length first
+    int path_len = 0;
+    for (int cur = goal_idx; cur != start_idx; cur = parent[cur]) {
+        path_len++;
+    }
+    path_len++; // include start
+
+    int *path = (int *)malloc(path_len * sizeof(int));
+    if (!path) {
+        printf("→ Memory allocation failed for path\n");
+        free(parent);
+        free(queue);
+        return;
     }
 
-    if (start_y < exit_y) {
-        printf("   4. Move NORTH towards exit\n");
-    } else if (start_y > exit_y) {
-        printf("   4. Move SOUTH towards exit\n");
+    int idx = 0;
+    for (int cur = goal_idx; cur != start_idx; cur = parent[cur]) {
+        path[idx++] = cur;
+    }
+    path[idx] = start_idx;
+
+    // Print path in forward order
+    int gx = goal_idx % sx;
+    int gy = (goal_idx / sx) % sy;
+    int gz = goal_idx / (sx * sy);
+    float dist = euclidean_distance_3d(start_x, start_y, start_z, gx, gy, gz);
+
+    printf("→ Exit reached: [%d,%d,%d] (%.1fm straight-line)\n", gx, gy, gz, dist);
+    printf("→ Path (%d steps):\n", path_len - 1);
+
+    for (int i = path_len - 1; i >= 0; i--) {
+        int px = path[i] % sx;
+        int py = (path[i] / sx) % sy;
+        int pz = path[i] / (sx * sy);
+        printf("   %d. [%d, %d, Floor %d]\n", path_len - i, px, py, pz);
     }
 
-    printf("   5. EXIT building at [%d,%d,%d]\n", exit_x, exit_y, exit_z);
-
-    // Check for obstacles in path
-    printf("\n⚠️  Path Warnings:\n");
-    bool warnings = false;
-    for (int z = start_z; z >= exit_z; z--) {
-        for (int y = (start_y < exit_y ? start_y : exit_y);
-             y <= (start_y > exit_y ? start_y : exit_y); y++) {
-            for (int x = (start_x < exit_x ? start_x : exit_x);
-                 x <= (start_x > exit_x ? start_x : exit_x); x++) {
-                if (building->grid[x][y][z].status >= ZONE_CRITICAL) {
-                    printf("   ⚠ Avoid zone [%d,%d,%d] - %s\n", x, y, z,
-                           building->grid[x][y][z].status == ZONE_COLLAPSED ?
-                           "COLLAPSED" : "CRITICAL DAMAGE");
-                    warnings = true;
-                }
-            }
-        }
-    }
-    if (!warnings) {
-        printf("   ✓ Path is clear\n");
-    }
+    #undef IDX
+    free(path);
+    free(parent);
+    free(queue);
 }
 
 //=============================================================================

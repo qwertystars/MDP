@@ -14,9 +14,8 @@
 #define SAMPLE_RATE 200  // Hz
 #define FFT_SIZE 1024
 
-// WiFi credentials - CHANGE THESE!
-const char* ssid = "DESKTOP-2LR5MU4";        // ← CHANGE THIS
-const char* password = "T05*790a";     // ← CHANGE THIS
+// WiFi credentials - copy config.h.example to config.h and edit
+#include "config.h"
 
 // Create two I2C buses
 TwoWire I2C_1 = TwoWire(0);
@@ -60,35 +59,71 @@ unsigned long sample_count = 0;
 unsigned long last_sample_time = 0;
 bool calibration_complete = false;
 
+// RMS and frequency tracking
+float current_rms = 0.0;
+float dominant_freq = 0.0;
+int fft_sample_idx = 0;
+
+// Alert thresholds (m/s²)
+#define ALERT_WARNING_RMS  0.05
+#define ALERT_CRITICAL_RMS 0.15
+
 WebServer server(80);
 
 // ==================== SENSOR FUNCTIONS ====================
 
-void writeADXL(TwoWire &wire, uint8_t reg, uint8_t data) {
+bool writeADXL(TwoWire &wire, uint8_t reg, uint8_t data) {
   wire.beginTransmission(ADXL345_ADDRESS);
   wire.write(reg);
   wire.write(data);
-  wire.endTransmission();
+  uint8_t err = wire.endTransmission();
+  if (err != 0) {
+    Serial.printf("ADXL write error %d (reg 0x%02X)\n", err, reg);
+    return false;
+  }
+  return true;
 }
 
-void readADXL(TwoWire &wire, uint8_t reg, uint8_t* buffer, uint8_t len) {
+bool readADXL(TwoWire &wire, uint8_t reg, uint8_t* buffer, uint8_t len) {
   wire.beginTransmission(ADXL345_ADDRESS);
   wire.write(reg);
-  wire.endTransmission(false);
-  wire.requestFrom(ADXL345_ADDRESS, len);
+  uint8_t err = wire.endTransmission(false);
+  if (err != 0) {
+    Serial.printf("ADXL read error %d (reg 0x%02X)\n", err, reg);
+    return false;
+  }
+  uint8_t count = wire.requestFrom(ADXL345_ADDRESS, len);
+  if (count != len) {
+    Serial.printf("ADXL: expected %d bytes, got %d\n", len, count);
+    return false;
+  }
   for (uint8_t i = 0; i < len; i++) {
     buffer[i] = wire.read();
   }
+  return true;
 }
 
-void initADXL(uint8_t sensor_id) {
+bool initADXL(uint8_t sensor_id) {
   TwoWire &wire = *I2C_BUS[sensor_id];
+
+  // Validate sensor by reading DEVID
+  uint8_t devid = 0;
+  if (!readADXL(wire, ADXL345_DEVID, &devid, 1) || devid != 0xE5) {
+    Serial.printf("Sensor %d: DEVID check failed (0x%02X), retrying...\n", sensor_id, devid);
+    delay(50);
+    if (!readADXL(wire, ADXL345_DEVID, &devid, 1) || devid != 0xE5) {
+      Serial.printf("Sensor %d: DEVID retry failed (0x%02X)\n", sensor_id, devid);
+      return false;
+    }
+  }
+
   writeADXL(wire, ADXL345_POWER_CTL, 0x00);
   delay(10);
   writeADXL(wire, ADXL345_DATA_FORMAT, 0x08);  // Full resolution, ±2g
   writeADXL(wire, ADXL345_BW_RATE, 0x0B);      // 200 Hz
   writeADXL(wire, ADXL345_POWER_CTL, 0x08);    // Measurement mode
   delay(10);
+  return true;
 }
 
 void readSensorData(uint8_t sensor_id) {
@@ -163,46 +198,116 @@ void performCalibration() {
 
 // ==================== WEB SERVER ====================
 
+const char* getAlertStatus() {
+  if (current_rms > ALERT_CRITICAL_RMS) return "CRITICAL";
+  if (current_rms > ALERT_WARNING_RMS) return "WARNING";
+  return "NORMAL";
+}
+
+const char* getAlertColor() {
+  if (current_rms > ALERT_CRITICAL_RMS) return "#e74c3c";
+  if (current_rms > ALERT_WARNING_RMS) return "#f39c12";
+  return "#27ae60";
+}
+
 void handleRoot() {
-  String html = "<!DOCTYPE html><html><head><title>SHM Monitor</title>";
-  html += "<meta http-equiv='refresh' content='2'>";
-  html += "<style>";
-  html += "body{font-family:Arial;margin:20px;background:#f0f0f0;}";
-  html += ".container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:10px;}";
-  html += "h1{color:#2c3e50;border-bottom:3px solid #3498db;padding-bottom:10px;}";
-  html += "table{width:100%;border-collapse:collapse;margin:20px 0;}";
-  html += "th,td{border:1px solid #ddd;padding:10px;text-align:left;}";
-  html += "th{background:#3498db;color:white;}";
-  html += ".value{font-weight:bold;color:#2c3e50;}";
-  html += "</style></head><body>";
-  html += "<div class='container'>";
-  html += "<h1>Structural Health Monitor</h1>";
-  html += "<p>Sample Rate: 200 Hz | Samples: " + String(sample_count) + "</p>";
-  
-  html += "<h2>Current Readings (Ensemble Average)</h2>";
-  html += "<table><tr><th>Axis</th><th>Acceleration (m/s²)</th><th>Acceleration (mg)</th></tr>";
-  for (int axis = 0; axis < 3; axis++) {
-    html += "<tr><td>" + String((char)('X' + axis)) + "</td>";
-    html += "<td class='value'>" + String(accel_ensemble[axis] * 9.81, 3) + "</td>";
-    html += "<td class='value'>" + String(accel_ensemble[axis] * 1000, 2) + "</td></tr>";
+  String html = R"rawliteral(<!DOCTYPE html><html><head><title>SHM Monitor</title>
+<style>
+body{font-family:Arial;margin:20px;background:#f0f0f0;}
+.container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1);}
+h1{color:#2c3e50;border-bottom:3px solid #3498db;padding-bottom:10px;}
+table{width:100%;border-collapse:collapse;margin:20px 0;}
+th,td{border:1px solid #ddd;padding:10px;text-align:left;}
+th{background:#3498db;color:white;}
+.value{font-weight:bold;color:#2c3e50;}
+#alert{padding:15px;border-radius:8px;color:white;font-size:1.2em;text-align:center;margin:15px 0;}
+.stats{display:flex;gap:20px;margin:15px 0;}
+.stat-box{flex:1;padding:15px;border-radius:8px;background:#ecf0f1;text-align:center;}
+.stat-box .label{font-size:0.85em;color:#7f8c8d;}
+.stat-box .val{font-size:1.4em;font-weight:bold;color:#2c3e50;}
+</style>
+<script>
+var es = new EventSource('/events');
+es.onmessage = function(e) {
+  var d = JSON.parse(e.data);
+  document.getElementById('samples').textContent = d.samples;
+  document.getElementById('rms').textContent = d.rms;
+  document.getElementById('freq').textContent = d.freq;
+  document.getElementById('alert').textContent = d.alert;
+  document.getElementById('alert').style.background = d.alertColor;
+  for (var a = 0; a < 3; a++) {
+    var ax = ['X','Y','Z'][a];
+    document.getElementById('ens_ms_'+ax).textContent = d.ensemble_ms[a];
+    document.getElementById('ens_mg_'+ax).textContent = d.ensemble_mg[a];
   }
-  html += "</table>";
-  
-  html += "<h2>Individual Sensors</h2>";
-  html += "<table><tr><th>Sensor</th><th>X (m/s²)</th><th>Y (m/s²)</th><th>Z (m/s²)</th></tr>";
-  for (int sensor = 0; sensor < NUM_SENSORS; sensor++) {
-    html += "<tr><td>Sensor " + String(sensor + 1) + "</td>";
-    for (int axis = 0; axis < 3; axis++) {
-      html += "<td class='value'>" + String(accel_g[sensor][axis] * 9.81, 3) + "</td>";
+  for (var s = 0; s < 2; s++) {
+    for (var a = 0; a < 3; a++) {
+      document.getElementById('s'+s+'_'+['X','Y','Z'][a]).textContent = d.sensors[s][a];
     }
-    html += "</tr>";
   }
-  html += "</table>";
-  
-  html += "<p>Last update: " + String(millis()/1000) + " seconds</p>";
-  html += "</div></body></html>";
-  
+  document.getElementById('uptime').textContent = d.uptime;
+};
+</script>
+</head><body>
+<div class='container'>
+<h1>Structural Health Monitor</h1>
+<div id='alert' style='background:#27ae60;'>NORMAL</div>
+<div class='stats'>
+  <div class='stat-box'><div class='label'>RMS (m/s&sup2;)</div><div class='val' id='rms'>--</div></div>
+  <div class='stat-box'><div class='label'>Dom. Freq (Hz)</div><div class='val' id='freq'>--</div></div>
+  <div class='stat-box'><div class='label'>Samples</div><div class='val' id='samples'>--</div></div>
+</div>
+<h2>Ensemble Average</h2>
+<table><tr><th>Axis</th><th>m/s&sup2;</th><th>mg</th></tr>
+<tr><td>X</td><td class='value' id='ens_ms_X'>--</td><td class='value' id='ens_mg_X'>--</td></tr>
+<tr><td>Y</td><td class='value' id='ens_ms_Y'>--</td><td class='value' id='ens_mg_Y'>--</td></tr>
+<tr><td>Z</td><td class='value' id='ens_ms_Z'>--</td><td class='value' id='ens_mg_Z'>--</td></tr>
+</table>
+<h2>Individual Sensors</h2>
+<table><tr><th>Sensor</th><th>X (m/s&sup2;)</th><th>Y (m/s&sup2;)</th><th>Z (m/s&sup2;)</th></tr>
+<tr><td>Sensor 1</td><td class='value' id='s0_X'>--</td><td class='value' id='s0_Y'>--</td><td class='value' id='s0_Z'>--</td></tr>
+<tr><td>Sensor 2</td><td class='value' id='s1_X'>--</td><td class='value' id='s1_Y'>--</td><td class='value' id='s1_Z'>--</td></tr>
+</table>
+<p>Uptime: <span id='uptime'>--</span>s | Sample Rate: 200 Hz</p>
+</div></body></html>)rawliteral";
+
   server.send(200, "text/html", html);
+}
+
+void handleEvents() {
+  // Build JSON payload
+  String json = "{";
+  json += "\"samples\":" + String(sample_count);
+  json += ",\"rms\":\"" + String(current_rms, 4) + "\"";
+  json += ",\"freq\":\"" + String(dominant_freq, 1) + "\"";
+  json += ",\"alert\":\"" + String(getAlertStatus()) + "\"";
+  json += ",\"alertColor\":\"" + String(getAlertColor()) + "\"";
+  json += ",\"uptime\":" + String(millis() / 1000);
+
+  json += ",\"ensemble_ms\":[";
+  for (int a = 0; a < 3; a++) {
+    if (a) json += ",";
+    json += "\"" + String(accel_ensemble[a] * 9.81, 3) + "\"";
+  }
+  json += "],\"ensemble_mg\":[";
+  for (int a = 0; a < 3; a++) {
+    if (a) json += ",";
+    json += "\"" + String(accel_ensemble[a] * 1000, 2) + "\"";
+  }
+  json += "],\"sensors\":[";
+  for (int s = 0; s < NUM_SENSORS; s++) {
+    if (s) json += ",";
+    json += "[";
+    for (int a = 0; a < 3; a++) {
+      if (a) json += ",";
+      json += "\"" + String(accel_g[s][a] * 9.81, 3) + "\"";
+    }
+    json += "]";
+  }
+  json += "]}";
+
+  String payload = "data: " + json + "\n\n";
+  server.send(200, "text/event-stream", payload);
 }
 
 // ==================== SETUP ====================
@@ -225,11 +330,8 @@ void setup() {
   // Initialize sensors
   Serial.println("Initializing sensors...");
   for (int i = 0; i < NUM_SENSORS; i++) {
-    initADXL(i);
-    uint8_t devid;
-    readADXL(*I2C_BUS[i], ADXL345_DEVID, &devid, 1);
-    Serial.printf("Sensor %d: %s (ID: 0x%02X)\n", 
-                  i+1, devid == 0xE5 ? "✓ OK" : "✗ Failed", devid);
+    bool ok = initADXL(i);
+    Serial.printf("Sensor %d: %s\n", i+1, ok ? "✓ OK" : "✗ Failed");
   }
   
   // Connect to WiFi
@@ -250,6 +352,7 @@ void setup() {
     Serial.println("Open browser: http://" + WiFi.localIP().toString());
     
     server.on("/", handleRoot);
+    server.on("/events", handleEvents);
     server.begin();
   } else {
     Serial.println("\n✗ WiFi failed - continuing offline");
@@ -283,7 +386,27 @@ void loop() {
     // Calculate average
     computeEnsembleAverage();
     sample_count++;
-    
+
+    // Compute RMS of ensemble magnitude (exclude gravity: Z - 1g)
+    float mag = sqrt(accel_ensemble[0]*accel_ensemble[0] +
+                     accel_ensemble[1]*accel_ensemble[1] +
+                     (accel_ensemble[2]-1.0)*(accel_ensemble[2]-1.0)) * 9.81;
+    current_rms = current_rms * 0.99 + mag * 0.01;  // exponential moving average
+
+    // Accumulate samples for FFT (use Z-axis vibration)
+    if (fft_sample_idx < FFT_SIZE) {
+      fft_input[fft_sample_idx] = accel_ensemble[2] - 1.0;  // remove gravity
+      fft_output[fft_sample_idx] = 0;
+      fft_sample_idx++;
+    }
+    if (fft_sample_idx >= FFT_SIZE) {
+      FFT.Windowing(FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+      FFT.Compute(FFT_FORWARD);
+      FFT.ComplexToMagnitude();
+      dominant_freq = FFT.MajorPeak();
+      fft_sample_idx = 0;
+    }
+
     // Print every 1000 samples (5 seconds)
     if (sample_count % 1000 == 0) {
       Serial.printf("\n[%lu] Ensemble: X=%6.3f Y=%6.3f Z=%6.3f m/s²\n",
