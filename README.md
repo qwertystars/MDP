@@ -36,17 +36,17 @@
 flowchart LR
   subgraph Edge
     A["ESP32 Nodes<br/>(ADXL345 / MPU-6050 / IMU)"] -->|MQTT / ESP-NOW| B[MQTT Broker]
-    A -->|Local HTTP (control)| F[Local Gateway (RPi)]
+    A -->|"Local HTTP (control)"| F["Local Gateway (RPi)"]
   end
 
-  B --> C[FastAPI Ingest / Control API]
+  B --> C["FastAPI Ingest / Control API"]
   F --> C
   C --> D["Processing Pipeline<br/>(workers / Celery / Prefect)"]
-  D --> E[Timeseries DB (InfluxDB / Timescale)]
-  D --> G[Object Storage (raw batches)]
-  E --> H[Grafana / UI]
-  H --> I[Operators / Engineers]
-  C --> J[Auth / Admin Service]
+  D --> E["Timeseries DB (InfluxDB / Timescale)"]
+  D --> G["Object Storage (raw batches)"]
+  E --> H["Grafana / UI"]
+  H --> I["Operators / Engineers"]
+  C --> J["Auth / Admin Service"]
 ```
 
 ---
@@ -340,6 +340,3 @@ The design prioritizes:
 
 ---
 
-**License**: [Your License]  
-**Contributors**: [Your Team]  
-**Contact**: [Your Contact Info]
